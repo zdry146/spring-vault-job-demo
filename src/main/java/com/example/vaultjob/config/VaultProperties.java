@@ -76,6 +76,20 @@ public class VaultProperties {
         private String secretId;
         /** If set, secret-id is read from this file (overrides secretId field). */
         private String secretIdFile;
+        /**
+         * Response-wrapping token issued by Vault at deploy time. If set, the
+         * job will call /v1/sys/wrapping/unwrap on startup to obtain a fresh
+         * secret_id (production-grade pattern - keeps secret_id out of config).
+         */
+        private String wrappingToken;
+        /** File variant of wrappingToken (read at startup). */
+        private String wrappingTokenFile;
+        /**
+         * If set, the unwrapped secret_id is also written to this file
+         * (mode 600 best-effort) so subsequent job runs can read it via
+         * the regular {@code secretIdFile} flow without re-unwrapping.
+         */
+        private String unwrapOutputFile;
 
         public String getRoleId() { return roleId; }
         public void setRoleId(String roleId) { this.roleId = roleId; }
@@ -83,6 +97,12 @@ public class VaultProperties {
         public void setSecretId(String secretId) { this.secretId = secretId; }
         public String getSecretIdFile() { return secretIdFile; }
         public void setSecretIdFile(String secretIdFile) { this.secretIdFile = secretIdFile; }
+        public String getWrappingToken() { return wrappingToken; }
+        public void setWrappingToken(String wrappingToken) { this.wrappingToken = wrappingToken; }
+        public String getWrappingTokenFile() { return wrappingTokenFile; }
+        public void setWrappingTokenFile(String wrappingTokenFile) { this.wrappingTokenFile = wrappingTokenFile; }
+        public String getUnwrapOutputFile() { return unwrapOutputFile; }
+        public void setUnwrapOutputFile(String unwrapOutputFile) { this.unwrapOutputFile = unwrapOutputFile; }
     }
 
     public static class Jdbc {

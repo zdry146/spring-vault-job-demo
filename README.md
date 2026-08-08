@@ -39,12 +39,13 @@ lease on shutdown.
 │   │   └── VaultHealthIndicator.java       # /actuator/health/vault UP/UNKNOWN/DOWN
 │   └── revoke/
 │       └── LeaseRevokingShutdownHook.java  # @PreDestroy + optional JVM hook
-├── src/test/java/...                       # Mockito unit tests (no real Vault needed); 54 tests
+├── src/test/java/...                       # Mockito unit tests (no real Vault needed); 62 tests
 ├── scripts/
 │   ├── vault-setup.sh                      # idempotent one-shot Vault admin setup
 │   └── wrap-secret-id.sh                   # re-fetch secret-id; writes to file with mode 600
 └── docs/
-    └── lifecycle.md                        # short-job vs long-job rotation pattern (B is implemented)
+    ├── lifecycle.md                        # short-job vs long-job rotation pattern (B is implemented)
+    └── vault-agent-sidecar.md              # Vault Agent daemon for VMs (alternative to demo's auth flow)
 ```
 
 ---
@@ -95,6 +96,40 @@ INFO  ... LongJobCredentialManager : Rotated DataSource: user=v-approle-new, ttl
 INFO  ... LongJobBatchRunner       : [attempt 2] Querying DB via rotating DataSource
 ```
 
+## Three ways to get `secret_id` into the job
+
+The demo supports three AppRole `secret_id` resolution modes (in priority order):
+
+| Mode | Env vars | When to use |
+|---|---|---|
+| **1. Wrapping token** (recommended for prod CI/CD) | `VAULT_WRAPPING_TOKEN` or `VAULT_WRAPPING_TOKEN_FILE` | CI/CD issues a wrapping token at deploy time; job unwraps on startup. Keeps `secret_id` out of any config / env / file at rest. |
+| **2. File on disk** | `VAULT_SECRET_ID_FILE` | Secret manager (k8s Secret, AWS SSM, Vault Agent) mounts the secret as a file. |
+| **3. Env var** (dev only) | `VAULT_SECRET_ID` | Local dev with `vault write -f ... secret-id` piped into `export`. |
+
+For Vault Agent (long-running daemon on the VM), see
+[`docs/vault-agent-sidecar.md`](docs/vault-agent-sidecar.md). For wrapped-token
+end-to-end CI/CD example, see `scripts/wrap-secret-id.sh`.
+
+```bash
+# Mode 1: Wrapping token (production CI/CD)
+export VAULT_ROLE_ID=...
+export VAULT_WRAPPING_TOKEN=hvs.xxxxx      # from CI/CD deploy step
+export VAULT_UNWRAP_OUTPUT_FILE=/run/vault/secret-id   # optional: cache for next run
+java -jar my-job.jar
+
+# Mode 2: File (k8s / Vault Agent / SSM)
+export VAULT_ROLE_ID=...
+export VAULT_SECRET_ID_FILE=/var/run/vault/secret-id
+java -jar my-job.jar
+
+# Mode 3: Direct env (dev only)
+export VAULT_ROLE_ID=...
+export VAULT_SECRET_ID=$(vault write -f auth/approle/role/$ROLE/secret-id | jq -r .data.secret_id)
+java -jar my-job.jar
+```
+
+---
+
 ## Quick start (local dev)
 
 ```bash
@@ -140,7 +175,7 @@ Vault, no Docker, no network.
 mvn test
 ```
 
-Coverage (54 tests, 8 classes):
+Coverage (62 tests, 9 classes):
 
 | Class | Tests | Covers |
 |---|---|---|
@@ -152,6 +187,7 @@ Coverage (54 tests, 8 classes):
 | `LongJobBatchRunnerTest` | 4 | happy query, retry on auth SQLException, no-retry on non-auth SQLException, no-retry on non-SQLException |
 | `VaultMetricsTest` | 5 | counter/timer/gauge registration, success vs failure, idempotent registration |
 | `VaultHealthIndicatorTest` | 5 | UNKNOWN at startup, UP recent, DOWN stale, threshold from interval, default 300s |
+| `WrappedSecretIdResolverTest` | 8 | unwrap happy path, file write, error responses, wrapping-token-from-file, optional output file |
 
 ---
 

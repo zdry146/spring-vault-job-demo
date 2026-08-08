@@ -247,6 +247,24 @@ Both beans are `@ConditionalOnProperty(... long-job.enabled=true)` +
 so they're inert in short-job mode and don't interfere with other
 actuator configurations.
 
+### B.6 Three ways to feed `secret_id` to the job
+
+The `VaultConfig` resolves the AppRole `secret_id` in this priority order:
+
+1. **`WrappedSecretIdResolver`** — active when `VAULT_WRAPPING_TOKEN` (or
+   `VAULT_WRAPPING_TOKEN_FILE`) is set. Calls `POST /v1/sys/wrapping/unwrap`
+   on startup to obtain a fresh `secret_id`. Production-grade pattern for
+   CI/CD-deployed jobs; the wrapping token itself is short-lived (single-use,
+   typically 5-10 min TTL), and the unwrapped `secret_id` then drives
+   normal AppRole auth.
+2. **File** — `VAULT_SECRET_ID_FILE` path. Most common in k8s (Secret
+   mounted as a file) or with Vault Agent (which writes to disk).
+3. **Env var** — `VAULT_SECRET_ID`. Dev only; never use in prod because
+   env vars end up in logs.
+
+See [`vault-agent-sidecar.md`](vault-agent-sidecar.md) for the Vault Agent
+daemon alternative (a separate pattern, not a code path in the demo).
+
 ---
 
 ## Choosing TTL parameters

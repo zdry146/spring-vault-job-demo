@@ -28,6 +28,15 @@ vault:
     secret-id: ${VAULT_SECRET_ID:}
     # Optional: if VAULT_SECRET_ID_FILE is set (path on disk), it overrides secret-id.
     secret-id-file: ${VAULT_SECRET_ID_FILE:}
+    # Optional: response-wrapping token (production-grade: CI/CD wraps at deploy
+    # time, the job unwraps on startup to get a fresh secret_id). Takes
+    # precedence over secret-id / secret-id-file when set.
+    # See docs/vault-agent-sidecar.md and scripts/wrap-secret-id.sh.
+    wrapping-token: ${VAULT_WRAPPING_TOKEN:}
+    wrapping-token-file: ${VAULT_WRAPPING_TOKEN_FILE:}
+    # Optional: write the unwrapped secret_id to this file (mode 600) so
+    # subsequent job runs can read it via secret-id-file without re-unwrapping.
+    unwrap-output-file: ${VAULT_UNWRAP_OUTPUT_FILE:}
 
   # --- Database role to read from database/creds/<db-role> ---
   database-role: ${VAULT_DB_ROLE:mydb-role}

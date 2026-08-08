@@ -1,5 +1,6 @@
 package com.example.vaultjob.config;
 
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -30,7 +31,8 @@ import java.nio.file.Paths;
 public class VaultConfig {
 
     @Bean
-    public VaultTemplate vaultTemplate(VaultProperties props) {
+    public VaultTemplate vaultTemplate(VaultProperties props,
+                                       ObjectProvider<WrappedSecretIdResolver> wrappedResolverProvider) {
         VaultEndpoint endpoint = VaultEndpoint.from(URI.create(props.getUri()));
 
         // Build a RestTemplate with explicit connect/read timeouts so a stuck
@@ -46,9 +48,18 @@ public class VaultConfig {
                             + " (this demo only wires approle)");
         }
 
+        // Priority for secret_id:
+        //   1. WrappedSecretIdResolver (active only when VAULT_WRAPPING_TOKEN is set)
+        //   2. File path (VAULT_SECRET_ID_FILE)
+        //   3. Env var (VAULT_SECRET_ID) - dev only
+        WrappedSecretIdResolver wrappedResolver = wrappedResolverProvider.getIfAvailable();
+        String secretId = (wrappedResolver != null)
+                ? wrappedResolver.resolve()
+                : resolveSecretId(props);
+
         AppRoleAuthenticationOptions options = AppRoleAuthenticationOptions.builder()
                 .roleId(RoleId.provided(props.getApprole().getRoleId()))
-                .secretId(SecretId.provided(resolveSecretId(props)))
+                .secretId(SecretId.provided(secretId))
                 .build();
 
         return new VaultTemplate(endpoint, new AppRoleAuthentication(options, restTemplate));
@@ -72,7 +83,8 @@ public class VaultConfig {
         String direct = props.getApprole().getSecretId();
         if (direct == null || direct.isBlank()) {
             throw new IllegalStateException(
-                    "Neither VAULT_SECRET_ID nor VAULT_SECRET_ID_FILE is set");
+                    "No AppRole secret_id available: set VAULT_WRAPPING_TOKEN, "
+                            + "VAULT_SECRET_ID_FILE, or VAULT_SECRET_ID");
         }
         return direct;
     }
