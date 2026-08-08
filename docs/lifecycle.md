@@ -2,15 +2,19 @@
 
 This document contrasts the two patterns you actually have to choose between when
 designing a Spring Boot job that reads dynamic database credentials from
-HashiCorp Vault. The codebase demos the **short-job** pattern; this doc shows
-how to extend it for long-running jobs.
+HashiCorp Vault. Both patterns are implemented in this repo:
+
+- **Pattern A (short job)** — `src/main/java/com/example/vaultjob/job/BatchJobRunner.java`
+- **Pattern B (long job)** — `src/main/java/com/example/vaultjob/longjob/` (5 classes)
+
+Toggle between them with `vault.long-job.enabled` (default `false`).
 
 ## TL;DR
 
-| Scenario | Expected runtime | Pattern | Effort |
-|---|---|---|---|
-| **Short job** | `< vault.lease_duration` | Fetch once at startup; revoke on shutdown | Demo code is enough |
-| **Long job** | `>= vault.lease_duration` | Renew lease + rotate `DataSource` periodically | Custom: see below |
+| Scenario | Expected runtime | Pattern | Effort | Code |
+|---|---|---|---|---|
+| **Short job** | `< vault.lease_duration` | Fetch once at startup; revoke on shutdown | Done | `BatchJobRunner` (default) |
+| **Long job** | `>= vault.lease_duration` | Renew lease + rotate `DataSource` periodically | Done | `LongJobBatchRunner` + `LongJobCredentialManager` |
 
 The demo's lease is configurable via `DB_DEFAULT_TTL` (default `5m`); for the
 short-job pattern set it comfortably above the worst-case job runtime.
@@ -75,54 +79,68 @@ lease_duration  ≥  2 × worst_observed_job_duration
 
 ## Pattern B: Long job (≥ lease duration)
 
+> **Status: implemented in this repo.** Set `vault.long-job.enabled=true` to
+> switch on `LongJobCredentialManager`, `LongJobBatchRunner`,
+> `RotatingDataSource`, `DataSourceFactory`, and `AuthFailureClassifier`.
+
 For jobs that run for hours. Requires four additions on top of the demo:
 
 1. A background **renewer** that calls `sys/leases/renew` before TTL expires.
+   — `LongJobCredentialManager` schedules at half the lease TTL.
 2. A **rotation strategy** for the JDBC pool when the underlying role changes.
+   — `RotatingDataSource` swaps target pool atomically; old pool closed after swap.
 3. **Retry-on-auth-failure** so a brief window during rotation doesn't kill the job.
+   — `LongJobBatchRunner` wraps every query in a `RetryTemplate` (5 attempts,
+   exponential backoff 2s → 30s, retries on any `SQLException`).
 4. **Failure isolation**: renewer errors must not crash the main job.
+   — `tickSafely()` catches all `RuntimeException` from the renew/rotate path;
+     `rotate()` is `synchronized` so concurrent ticks can never double-rotate.
 
-### B.1 Sketch
+### B.1 Sketch (now: implemented code)
 
 ```java
 @Component
+@ConditionalOnProperty(name = "vault.long-job.enabled", havingValue = "true")
 public class LongJobCredentialManager {
+    // ... fields: provider, factory, scheduler, rotatingDs, activeCreds, ...
 
-    private static final Logger log = LoggerFactory.getLogger(LongJobCredentialManager.class);
-
-    private final VaultCredentialProvider provider;
-    private final DataSourceFactory factory;
-    private final long renewBeforeSeconds;
-    private final AtomicReference<DataSource> currentDs = new AtomicReference<>();
-    private final AtomicReference<DbCredentials> currentCreds = new AtomicReference<>();
-
-    public LongJobCredentialManager(...) {
-        // schedule renewer on a single-thread executor at half the lease TTL
-        long renewInterval = Math.max(60, currentCreds.get().leaseDurationSeconds() / 2);
-        Executors.newSingleThreadScheduledExecutor()
-            .scheduleAtFixedRate(this::tick, renewInterval, renewInterval, SECONDS);
+    @PostConstruct
+    public void start() {
+        DbCredentials initial = provider.fetchCredentials();
+        rotatingDs = new RotatingDataSource(factory.build(initial));
+        activeCreds.set(initial);
+        long interval = configuredRenewIntervalSeconds > 0
+            ? configuredRenewIntervalSeconds
+            : Math.max(30L, initial.leaseDurationSeconds() / 2L);
+        scheduler.scheduleAtFixedRate(this::tickSafely, interval, interval, TimeUnit.SECONDS);
     }
 
-    private void tick() {
-        DbCredentials creds = currentCreds.get();
-        long renewed = provider.renewLease(creds);
-        if (renewed == 0 || renewed <= renewBeforeSeconds) {
-            log.warn("Lease renewal degraded (got {}s) — rotating DataSource", renewed);
-            rotate();
-        } else {
-            log.debug("Lease renewed; new TTL {}s", renewed);
+    private void tickSafely() {
+        if (!started) return;
+        try {
+            DbCredentials creds = activeCreds.get();
+            long renewed = provider.renewLease(creds);
+            if (renewed == 0L || renewed <= renewThresholdSeconds) {
+                rotate();
+            } else {
+                log.debug("Lease renewed; new TTL = {}s", renewed);
+            }
+        } catch (RuntimeException e) {
+            log.error("Renew tick failed (will retry next interval)", e);  // failure isolation
         }
     }
 
-    private void rotate() {
-        DbCredentials fresh = provider.fetchCredentials();
-        DataSource next = factory.build(fresh);
-        DataSource old = currentDs.getAndSet(next);
-        try { if (old instanceof AutoCloseable c) c.close(); } catch (Exception ignored) {}
-        currentCreds.set(fresh);
+    private synchronized void rotate() { /* fetch + build + swap + close old */ }
+
+    @PreDestroy
+    public void stop() {
+        started = false;
+        scheduler.shutdown();
+        // ... wait + shutdownNow fallback ...
+        // Lease revocation is handled centrally by LeaseRevokingShutdownHook
     }
 
-    public DataSource dataSource() { return currentDs.get(); }
+    public DataSource dataSource() { return rotatingDs; }
 }
 ```
 
@@ -131,36 +149,64 @@ public class LongJobCredentialManager {
 Hikari does not support swapping the password of an existing pool. Three
 practical choices:
 
-| Option | Trade-off |
-|---|---|
-| **Full pool swap** (`HikariDataSource.close()` + new) | Simple; in-flight queries on old connections fail. Tolerable for batch jobs that retry on auth error. |
-| **Per-connection wrap** (custom `DataSource`) | Most code; preserves in-flight queries. |
-| **Evict-only** (`evictConnection(...)`) | Single connection swap; complex to wire to Hikari internals. |
+| Option | Trade-off | Status |
+|---|---|---|
+| **Full pool swap** (`HikariDataSource.close()` + new) | Simple; in-flight queries on old connections fail. Tolerable for batch jobs that retry on auth error. | **Chosen** — `RotatingDataSource.rotate()` |
+| **Per-connection wrap** (custom `DataSource`) | Most code; preserves in-flight queries. | Not implemented |
+| **Evict-only** (`evictConnection(...)`) | Single connection swap; complex to wire to Hikari internals. | Not implemented |
 
 For batch jobs, **full pool swap** is usually fine — Hikari's
 `connectionTestQuery` (or `connectionInitSql` on PG) ensures the new pool
-validates each new connection before handing it out.
+validates each new connection before handing it out. The retry policy in
+B.3 absorbs the auth error that an in-flight query on a closed connection
+might surface.
+
+`RotatingDataSource extends DelegatingDataSource` is the trick that makes
+this work: Spring beans that captured it (e.g. `JdbcTemplate` constructed
+by Boot's auto-config) keep the same reference, but every call is
+forwarded to the current target pool. No need to rewire Spring beans.
 
 ### B.3 Retry-on-auth-failure
 
-Wrap the business logic:
+Implemented in `LongJobBatchRunner`:
 
 ```java
-RetryTemplate retry = RetryTemplate.builder()
-    .maxAttempts(3)
-    .exponentialBackoff(2_000, 2.0, 30_000)
-    .retryOn(SQLException.class)
-    .build();
+SimpleRetryPolicy policy = new SimpleRetryPolicy(
+    5, Map.of(SQLException.class, true), /* traverseCauses */ true);
+ExponentialBackOffPolicy backoff = new ExponentialBackOffPolicy();
+backoff.setInitialInterval(2_000L); backoff.setMultiplier(2.0); backoff.setMaxInterval(30_000L);
+RetryTemplate retry = new RetryTemplate();
+retry.setRetryPolicy(policy); retry.setBackOffPolicy(backoff);
 
-retry.execute(ctx -> batchJob.runOnce());
+@Override
+public void run(String... args) throws SQLException {
+    Integer count = retry.execute(this::doQuery);
+}
+
+private Integer doQuery(RetryContext ctx) throws SQLException {
+    try (Connection c = dataSource.getConnection(); Statement s = c.createStatement(); ...) { ... }
+}
 ```
+
+The retry policy is broad (`SQLException`) on purpose. Over-retry of a
+non-auth error terminates quickly because the exception is deterministic
+(the second attempt throws the same error). If you want a tighter
+classifier, `AuthFailureClassifier` covers PG/MySQL/Oracle/SQL Server
+SQLState codes — wire it into a custom `RetryPolicy` if needed.
 
 `SQLException` with state `28000` / `28P01` (PostgreSQL) / `ORA-01017`
 (Oracle) signals credential rotation in progress — not a real failure.
+The classifier treats these as expected transient errors.
 
-### B.4 What this demo doesn't implement
+**Why method reference, not lambda:** `RetryTemplate.execute` has signature
+`<T, E extends Throwable> T execute(RetryCallback<T, E>) throws E`. A
+lambda body can't declare `throws E`, but a method reference can — the
+private `doQuery(RetryContext) throws SQLException` method is what lets
+the checked exception flow up to Spring Retry's classifier unchanged.
 
-For a complete long-job pattern, you'd also want:
+### B.4 What this implementation does NOT include
+
+For a production-grade long-job pattern, you'd also want:
 
 - **Out-of-process credential cache** if multiple job instances run in
   parallel and you want a shared revocation point.
@@ -169,6 +215,12 @@ For a complete long-job pattern, you'd also want:
   recent renewal succeeded.
 - **Graceful kill handling**: if the JVM is SIGKILLed mid-run, Vault will
   revoke on lease expiry anyway — but you lose deterministic timing.
+  (Easy add: an extra `Runtime.addShutdownHook()` call alongside
+  `@PreDestroy`.)
+- **Active revocation when renew-threshold is crossed but rotation fails**:
+  today's `rotate()` catches its own failures and keeps the current pool,
+  but the lease could be in an unknown state on the Vault side. A future
+  improvement would be to log `vault token lookup-self` results.
 
 ---
 

@@ -42,6 +42,12 @@
             <version>${spring-vault.version}</version>
         </dependency>
 
+        <!-- Spring Retry: pattern B retry-on-auth-failure wrapper for the long-job runner -->
+        <dependency>
+            <groupId>org.springframework.retry</groupId>
+            <artifactId>spring-retry</artifactId>
+        </dependency>
+
         <!-- Database driver: PostgreSQL example. Swap to mysql-connector-j if needed. -->
         <dependency>
             <groupId>org.postgresql</groupId>

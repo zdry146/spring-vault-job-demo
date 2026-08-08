@@ -32,6 +32,8 @@ public class VaultProperties {
      */
     private long renewBeforeExpirySeconds = 300;
 
+    private LongJob longJob = new LongJob();
+
     public String getUri() { return uri; }
     public void setUri(String uri) { this.uri = uri; }
     public int getConnectionTimeoutSeconds() { return connectionTimeoutSeconds; }
@@ -48,6 +50,26 @@ public class VaultProperties {
     public void setJdbc(Jdbc jdbc) { this.jdbc = jdbc; }
     public long getRenewBeforeExpirySeconds() { return renewBeforeExpirySeconds; }
     public void setRenewBeforeExpirySeconds(long v) { this.renewBeforeExpirySeconds = v; }
+    public LongJob getLongJob() { return longJob; }
+    public void setLongJob(LongJob longJob) { this.longJob = longJob; }
+
+    /**
+     * Sub-config for the long-job pattern (Pattern B). Only consulted when
+     * {@code vault.long-job.enabled=true}.
+     */
+    public static class LongJob {
+        private boolean enabled = false;
+        /**
+         * Override the auto-computed (lease/2) scheduler interval. 0 = auto.
+         * Useful for testing or when you know your job's worst-case runtime.
+         */
+        private long renewIntervalSeconds = 0L;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public long getRenewIntervalSeconds() { return renewIntervalSeconds; }
+        public void setRenewIntervalSeconds(long v) { this.renewIntervalSeconds = v; }
+    }
 
     public static class AppRole {
         private String roleId;

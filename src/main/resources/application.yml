@@ -41,6 +41,16 @@ vault:
   # 0 = disable renewal (job will rely on initial TTL only).
   renew-before-expiry-seconds: ${LEASE_RENEW_BEFORE_SECONDS:300}
 
+  # --- Long-job mode (Pattern B) ---
+  # Set to true for jobs that may outlive the lease. Wires up
+  # LongJobCredentialManager (background renewer + DataSource swap) and
+  # LongJobBatchRunner (RetryTemplate-wrapped runner).
+  long-job:
+    enabled: ${VAULT_LONG_JOB_ENABLED:false}
+    # Override the auto-computed (lease/2) scheduler interval. 0 = auto.
+    # Useful when you know worst-case runtime and want predictable cadence.
+    renew-interval-seconds: ${VAULT_RENEW_INTERVAL_SECONDS:0}
+
 # Hikari pool settings (applied when DataSourceFactory builds HikariConfig)
 hikari:
   maximum-pool-size: 5

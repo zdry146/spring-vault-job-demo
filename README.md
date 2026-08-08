@@ -15,27 +15,33 @@ lease on shutdown.
 
 ```
 .
-├── pom.xml                                 # Spring Boot 3.3.5 + spring-vault-core 3.1.x, Java 21
+├── pom.xml                                 # Spring Boot 3.3.5 + spring-vault-core 3.1.x + spring-retry, Java 21
 ├── docker-compose.yml                      # Vault (dev mode) + Postgres 16 for local testing
 ├── src/main/java/com/example/vaultjob/
 │   ├── DemoApplication.java                # CLI entry; uses SpringApplication.exit()
 │   ├── config/
 │   │   ├── VaultProperties.java            # @ConfigurationProperties("vault")
 │   │   ├── VaultConfig.java                # VaultTemplate bean + AppRole auth wiring
-│   │   └── DataSourceConfig.java           # HikariDataSource built from Vault creds
+│   │   └── DataSourceConfig.java           # Conditional: short or long-job DataSource bean
 │   ├── credentials/
 │   │   ├── DbCredentials.java              # record (user, pass, leaseId, ttl)
 │   │   └── VaultCredentialProvider.java    # read/renew/revoke leases; tracks outstanding ones
 │   ├── job/
-│   │   └── BatchJobRunner.java             # CommandLineRunner; sample SELECT
+│   │   └── BatchJobRunner.java             # CommandLineRunner (short-job mode)
+│   ├── longjob/                            # Pattern B (long-job mode)
+│   │   ├── DataSourceFactory.java          # Builds HikariDataSource from creds (reusable)
+│   │   ├── RotatingDataSource.java         # DelegatingDataSource that swaps target pool
+│   │   ├── AuthFailureClassifier.java      # SQLState classifier (PG/MySQL/Oracle/SQL Server)
+│   │   ├── LongJobCredentialManager.java   # @PostConstruct start + renewer scheduler + rotate
+│   │   └── LongJobBatchRunner.java         # RetryTemplate-wrapped CommandLineRunner
 │   └── revoke/
 │       └── LeaseRevokingShutdownHook.java  # @PreDestroy + optional JVM hook
-├── src/test/java/...                       # Mockito unit tests (no real Vault needed)
+├── src/test/java/...                       # Mockito unit tests (no real Vault needed); 32 tests
 ├── scripts/
 │   ├── vault-setup.sh                      # idempotent one-shot Vault admin setup
 │   └── wrap-secret-id.sh                   # re-fetch secret-id; writes to file with mode 600
 └── docs/
-    └── lifecycle.md                        # short-job vs long-job rotation pattern
+    └── lifecycle.md                        # short-job vs long-job rotation pattern (B is implemented)
 ```
 
 ---
@@ -49,6 +55,42 @@ lease on shutdown.
 - `jq` for the setup script
 
 ---
+
+## Two modes: short-job vs long-job
+
+The repo ships both lifecycle patterns (see [`docs/lifecycle.md`](docs/lifecycle.md) for the full
+discussion). They are mutually exclusive; flip with one config flag:
+
+| Mode | Config | Active bean | When to use |
+|---|---|---|---|
+| **Short** (default) | `vault.long-job.enabled=false` | `BatchJobRunner` + `shortJobDataSource` | Job runtime `<` Vault lease duration |
+| **Long** | `vault.long-job.enabled=true` | `LongJobBatchRunner` + `LongJobCredentialManager` | Job runtime `≥` Vault lease duration; needs renewal + rotation |
+
+```bash
+# Short-job (default)
+mvn spring-boot:run
+
+# Long-job
+VAULT_LONG_JOB_ENABLED=true mvn spring-boot:run
+```
+
+In long-job mode the log will show the manager starting and scheduling renews:
+
+```
+INFO  ... LongJobCredentialManager : LongJobCredentialManager started: user=v-approle-..., ttl=300s, renew_interval=150s, threshold=300s
+INFO  ... LongJobBatchRunner       : === Long-running batch job started ===
+INFO  ... LongJobBatchRunner       : [attempt 1] Querying DB via rotating DataSource
+INFO  ... LongJobBatchRunner       : [attempt 1] Public tables visible to dynamic user: N
+INFO  ... LongJobBatchRunner       : === Long-running batch job finished cleanly (tables=N) ===
+```
+
+If a credential rotation happens mid-job you'll see something like:
+
+```
+WARN  ... LongJobCredentialManager : Lease renewal insufficient (renewed=180s, threshold=300s); rotating
+INFO  ... LongJobCredentialManager : Rotated DataSource: user=v-approle-new, ttl=600s
+INFO  ... LongJobBatchRunner       : [attempt 2] Querying DB via rotating DataSource
+```
 
 ## Quick start (local dev)
 
@@ -95,11 +137,15 @@ Vault, no Docker, no network.
 mvn test
 ```
 
-Coverage:
+Coverage (32 tests, 5 classes):
 
-- `VaultCredentialProviderTest` — happy path, missing fields, multi-lease
-  revocation, exception isolation during revocation.
-- `BatchJobRunnerTest` — verifies JdbcTemplate is invoked with the Vault creds.
+| Class | Tests | Covers |
+|---|---|---|
+| `VaultCredentialProviderTest` | 4 | happy path, missing fields, multi-lease revocation, exception isolation |
+| `BatchJobRunnerTest` | 1 | short-job runner with Vault creds |
+| `AuthFailureClassifierTest` | 15 | PG/MySQL/Oracle/SQL Server SQLStates, cause chains, edge cases |
+| `LongJobCredentialManagerTest` | 9 | initial fetch, renew/rotate thresholds, failure isolation, stop semantics |
+| `LongJobBatchRunnerTest` | 3 | happy query, retry on SQLException, non-SQLException propagation |
 
 ---
 

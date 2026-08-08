@@ -5,11 +5,17 @@ import com.example.vaultjob.credentials.VaultCredentialProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
 /**
  * Sample batch logic — runs once when the Spring context is ready.
+ *
+ * <p>Active only in short-job mode ({@code vault.long-job.enabled=false},
+ * the default). For long-job mode, see
+ * {@link com.example.vaultjob.longjob.LongJobBatchRunner} which adds
+ * rotation-aware retry.</p>
  *
  * <p>The injected {@link JdbcTemplate} uses the Hikari pool built in
  * {@link com.example.vaultjob.config.DataSourceConfig}, whose credentials
@@ -21,6 +27,7 @@ import org.springframework.stereotype.Component;
  * </ol>
  */
 @Component
+@ConditionalOnProperty(name = "vault.long-job.enabled", havingValue = "false", matchIfMissing = true)
 public class BatchJobRunner implements CommandLineRunner {
 
     private static final Logger log = LoggerFactory.getLogger(BatchJobRunner.class);
