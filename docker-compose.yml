@@ -1,0 +1,39 @@
+# Local dev stack: Vault (dev mode) + Postgres
+# ----------------------------------------------------------------------------
+# Start:    docker compose up -d
+# Tear down: docker compose down -v
+#
+# Vault dev mode prints a root token to logs; capture it:
+#   docker compose logs vault | grep "Root Token"
+# Then export VAULT_TOKEN and run scripts/vault-setup.sh.
+#
+# !! WARNING: -dev is INSECURE. Never use it for anything beyond local testing. !!
+# ----------------------------------------------------------------------------
+
+services:
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault-dev
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      # dev mode is auto-unsealed; root token is printed to stdout
+      VAULT_DEV_ROOT_TOKEN_ID: "root"  # dev only; production uses real unseal
+    cap_add:
+      - IPC_LOCK
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-dev
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: vault_admin
+      POSTGRES_PASSWORD: vault_admin_pw
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault_admin -d mydb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

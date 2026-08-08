@@ -1,0 +1,56 @@
+# Spring Boot config for spring-vault-job-demo
+# ----------------------------------------------------------------------------
+# All sensitive values MUST be supplied via environment variables in production.
+# Defaults below assume a local Vault dev mode + local Postgres (see docker-compose.yml).
+# ----------------------------------------------------------------------------
+
+spring:
+  application:
+    name: spring-vault-job-demo
+
+  # spring.datasource.* is intentionally NOT set here.
+  # The DataSource is built at runtime in DataSourceFactory after fetching
+  # credentials from Vault. See DbCredentialsProperties below.
+
+vault:
+  # --- Connection ---
+  uri: ${VAULT_ADDR:http://127.0.0.1:8200}
+  # seconds for HTTP connect/read; low so job fails fast if Vault unreachable
+  connection-timeout-seconds: 5
+  read-timeout-seconds: 10
+
+  # --- Auth (AppRole; the canonical method for batch jobs on VMs) ---
+  auth-method: approle
+  approle:
+    role-id: ${VAULT_ROLE_ID:}
+    # In production, secret-id should come from a file/secret-manager, NOT an env var.
+    # For demo convenience we accept env; for ops-grade, see scripts/wrap-secret-id.sh.
+    secret-id: ${VAULT_SECRET_ID:}
+    # Optional: if VAULT_SECRET_ID_FILE is set (path on disk), it overrides secret-id.
+    secret-id-file: ${VAULT_SECRET_ID_FILE:}
+
+  # --- Database role to read from database/creds/<db-role> ---
+  database-role: ${VAULT_DB_ROLE:mydb-role}
+
+  # --- Database connection (host/port/db name are NOT secret; user/pass come from Vault) ---
+  jdbc:
+    url: ${DB_JDBC_URL:jdbc:postgresql://127.0.0.1:5432/mydb}
+
+  # --- Lease behaviour ---
+  # If the job runs longer than this, we proactively renew the lease.
+  # 0 = disable renewal (job will rely on initial TTL only).
+  renew-before-expiry-seconds: ${LEASE_RENEW_BEFORE_SECONDS:300}
+
+# Hikari pool settings (applied when DataSourceFactory builds HikariConfig)
+hikari:
+  maximum-pool-size: 5
+  minimum-idle: 1
+  connection-timeout: 5000
+  validation-timeout: 3000
+  # After credential rotation, fail any open connection older than this.
+  max-connection-age: ${HIKARI_MAX_CONNECTION_AGE_SECONDS:600}
+
+logging:
+  level:
+    com.example.vaultjob: INFO
+    org.springframework.vault: WARN

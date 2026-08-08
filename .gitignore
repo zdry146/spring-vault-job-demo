@@ -1,0 +1,30 @@
+# Maven
+target/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+
+# Local secrets — never commit
+.env
+.env.local
+*.env
+secrets/
+
+# Spring Boot
+HELP.md
+application-local.yml
+
+# Logs
+*.log
+logs/
