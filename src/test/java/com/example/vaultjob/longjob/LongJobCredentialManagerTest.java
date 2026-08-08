@@ -6,6 +6,7 @@ import com.example.vaultjob.credentials.VaultCredentialProvider;
 import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -29,7 +30,11 @@ class LongJobCredentialManagerTest {
         factory = mock(DataSourceFactory.class);
         props = new VaultProperties();
         props.setRenewBeforeExpirySeconds(300);
-        mgr = new LongJobCredentialManager(provider, factory, props);
+        // ObjectProvider that returns null (no metrics in unit tests by default)
+        @SuppressWarnings("unchecked")
+        ObjectProvider<VaultMetrics> metricsProvider = mock(ObjectProvider.class);
+        when(metricsProvider.getIfAvailable()).thenReturn(null);
+        mgr = new LongJobCredentialManager(provider, factory, props, metricsProvider);
     }
 
     @Test
@@ -167,5 +172,63 @@ class LongJobCredentialManagerTest {
         // Same as above — interval is encapsulated; test asserts no crash
         // when an override is present.
         assertThat(mgr.dataSource()).isNotNull();
+    }
+
+    @Test
+    void tick_recordsRenewalSuccessOnMetrics_whenPresent() {
+        DbCredentials initial = new DbCredentials("u", "p", "lease", 600L);
+        HikariDataSource ds1 = mock(HikariDataSource.class);
+        when(provider.fetchCredentials()).thenReturn(initial);
+        when(factory.build(initial)).thenReturn(ds1);
+        when(provider.renewLease(initial)).thenReturn(600L);
+
+        VaultMetrics metrics = mock(VaultMetrics.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<VaultMetrics> mp = mock(ObjectProvider.class);
+        when(mp.getIfAvailable()).thenReturn(metrics);
+        mgr = new LongJobCredentialManager(provider, factory, props, mp);
+
+        mgr.start();
+        mgr.tickSafely();
+
+        verify(metrics).recordRenewalSuccess();
+        verify(metrics, never()).recordRenewalFailure();
+    }
+
+    @Test
+    void tick_recordsRenewalFailureOnMetrics_whenRotationTriggered() {
+        DbCredentials initial = new DbCredentials("u", "p", "lease", 600L);
+        DbCredentials fresh = new DbCredentials("u2", "p2", "lease-2", 600L);
+        HikariDataSource ds1 = mock(HikariDataSource.class);
+        HikariDataSource ds2 = mock(HikariDataSource.class);
+        when(provider.fetchCredentials()).thenReturn(initial).thenReturn(fresh);
+        when(factory.build(initial)).thenReturn(ds1);
+        when(factory.build(fresh)).thenReturn(ds2);
+        when(provider.renewLease(initial)).thenReturn(50L);  // below threshold -> rotate
+
+        VaultMetrics metrics = mock(VaultMetrics.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<VaultMetrics> mp = mock(ObjectProvider.class);
+        when(mp.getIfAvailable()).thenReturn(metrics);
+        mgr = new LongJobCredentialManager(provider, factory, props, mp);
+
+        mgr.start();
+        mgr.tickSafely();
+
+        verify(metrics).recordRenewalFailure();
+        verify(metrics, never()).recordRenewalSuccess();
+    }
+
+    @Test
+    void tick_metricsProviderReturnsNull_doesNotCrash() {
+        DbCredentials initial = new DbCredentials("u", "p", "lease", 600L);
+        HikariDataSource ds1 = mock(HikariDataSource.class);
+        when(provider.fetchCredentials()).thenReturn(initial);
+        when(factory.build(initial)).thenReturn(ds1);
+        when(provider.renewLease(initial)).thenReturn(600L);
+        // metricsProvider.getIfAvailable() returns null (default in setUp)
+
+        mgr.start();
+        mgr.tickSafely();  // must not crash
     }
 }

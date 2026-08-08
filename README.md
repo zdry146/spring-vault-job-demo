@@ -32,11 +32,14 @@ lease on shutdown.
 │   │   ├── DataSourceFactory.java          # Builds HikariDataSource from creds (reusable)
 │   │   ├── RotatingDataSource.java         # DelegatingDataSource that swaps target pool
 │   │   ├── AuthFailureClassifier.java      # SQLState classifier (PG/MySQL/Oracle/SQL Server)
+│   │   ├── AuthFailureRetryPolicy.java     # RetryPolicy: only retry auth failures
 │   │   ├── LongJobCredentialManager.java   # @PostConstruct start + renewer scheduler + rotate
-│   │   └── LongJobBatchRunner.java         # RetryTemplate-wrapped CommandLineRunner
+│   │   ├── LongJobBatchRunner.java         # AuthFailureRetryPolicy-wrapped CommandLineRunner
+│   │   ├── VaultMetrics.java                # Micrometer counters/timers/gauges (long-job only)
+│   │   └── VaultHealthIndicator.java       # /actuator/health/vault UP/UNKNOWN/DOWN
 │   └── revoke/
 │       └── LeaseRevokingShutdownHook.java  # @PreDestroy + optional JVM hook
-├── src/test/java/...                       # Mockito unit tests (no real Vault needed); 32 tests
+├── src/test/java/...                       # Mockito unit tests (no real Vault needed); 54 tests
 ├── scripts/
 │   ├── vault-setup.sh                      # idempotent one-shot Vault admin setup
 │   └── wrap-secret-id.sh                   # re-fetch secret-id; writes to file with mode 600
@@ -137,15 +140,71 @@ Vault, no Docker, no network.
 mvn test
 ```
 
-Coverage (32 tests, 5 classes):
+Coverage (54 tests, 8 classes):
 
 | Class | Tests | Covers |
 |---|---|---|
 | `VaultCredentialProviderTest` | 4 | happy path, missing fields, multi-lease revocation, exception isolation |
 | `BatchJobRunnerTest` | 1 | short-job runner with Vault creds |
 | `AuthFailureClassifierTest` | 15 | PG/MySQL/Oracle/SQL Server SQLStates, cause chains, edge cases |
-| `LongJobCredentialManagerTest` | 9 | initial fetch, renew/rotate thresholds, failure isolation, stop semantics |
-| `LongJobBatchRunnerTest` | 3 | happy query, retry on SQLException, non-SQLException propagation |
+| `AuthFailureRetryPolicyTest` | 8 | first-attempt returns true, retry only on auth, max-attempts cap, cause-chain walk |
+| `LongJobCredentialManagerTest` | 12 | initial fetch, renew/rotate thresholds, failure isolation, stop semantics, metrics recording |
+| `LongJobBatchRunnerTest` | 4 | happy query, retry on auth SQLException, no-retry on non-auth SQLException, no-retry on non-SQLException |
+| `VaultMetricsTest` | 5 | counter/timer/gauge registration, success vs failure, idempotent registration |
+| `VaultHealthIndicatorTest` | 5 | UNKNOWN at startup, UP recent, DOWN stale, threshold from interval, default 300s |
+
+---
+
+## Observability (long-job mode only)
+
+`VaultMetrics` + `VaultHealthIndicator` are wired only when both
+`vault.long-job.enabled=true` AND `spring-boot-starter-actuator` +
+`micrometer-registry-prometheus` are on the classpath. Endpoints are
+exposed via Spring Boot Actuator; `application.yml` already exposes
+`health,prometheus` (override via `MANAGEMENT_ENDPOINTS`).
+
+### Prometheus metrics — `GET /actuator/prometheus`
+
+| Metric | Type | Description |
+|---|---|---|
+| `vault_lease_renewals_total{result="success"}` | counter | Successful lease renewals |
+| `vault_lease_renewals_total{result="failure"}` | counter | Failed renewals (incl. those triggering rotation) |
+| `vault_lease_rotations_total` | counter | Times a fresh credential pair was issued |
+| `vault_lease_rotation_duration_seconds` | timer (histogram) | End-to-end rotation latency |
+| `vault_lease_last_renew_timestamp` | gauge | Epoch ms of last successful renewal (`0` = none yet) |
+
+### Health check — `GET /actuator/health/vault`
+
+| Status | When |
+|---|---|
+| `UNKNOWN` | Startup grace period — no renewal has happened yet |
+| `UP` | Last successful renewal within `threshold` (default `2 × renew interval`; falls back to 300s when interval is auto-computed) |
+| `DOWN` | Last successful renewal older than `threshold` (Vault likely unreachable) |
+
+Sample response:
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "vault": {
+      "status": "UP",
+      "details": { "age_seconds": 42, "threshold_seconds": 300 }
+    }
+  }
+}
+```
+
+### Design notes
+
+- `LongJobCredentialManager` injects `VaultMetrics` via `ObjectProvider`, so
+  the class has no hard dep on the metrics stack — short-job mode
+  (no actuator) keeps working.
+- `recordMetric()` swallows any metric exception so a misbehaving meter
+  registry can never break the renewer scheduler.
+- `AuthFailureRetryPolicy` replaces the previous broad `SimpleRetryPolicy`:
+  only credential-rotation-era errors (PG 28P01, MySQL 1045, Oracle ORA-01017,
+  SQL Server 18456) are retried; everything else propagates immediately.
 
 ---
 

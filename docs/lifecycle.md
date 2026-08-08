@@ -188,11 +188,10 @@ private Integer doQuery(RetryContext ctx) throws SQLException {
 }
 ```
 
-The retry policy is broad (`SQLException`) on purpose. Over-retry of a
-non-auth error terminates quickly because the exception is deterministic
-(the second attempt throws the same error). If you want a tighter
-classifier, `AuthFailureClassifier` covers PG/MySQL/Oracle/SQL Server
-SQLState codes — wire it into a custom `RetryPolicy` if needed.
+> **Updated:** the broad `SimpleRetryPolicy` was replaced by
+> `AuthFailureRetryPolicy` (B from this turn's task list) which delegates
+> to `AuthFailureClassifier`. Now only credential-rotation-era errors
+> are retried; everything else propagates immediately.
 
 `SQLException` with state `28000` / `28P01` (PostgreSQL) / `ORA-01017`
 (Oracle) signals credential rotation in progress — not a real failure.
@@ -204,15 +203,20 @@ lambda body can't declare `throws E`, but a method reference can — the
 private `doQuery(RetryContext) throws SQLException` method is what lets
 the checked exception flow up to Spring Retry's classifier unchanged.
 
+**Gotcha on `AuthFailureRetryPolicy.canRetry`:** it MUST return `true`
+when `context.getLastThrowable() == null`. Spring Retry calls `canRetry`
+*before* the first attempt to decide whether to enter the do-while loop.
+Returning `false` here causes `handleRetryExhausted` to fire
+immediately, wrapping the absent throwable in `RetryException("Exception
+in retry", null)` — which is the symptom that initially made the tests
+fail. The pattern mirrors `SimpleRetryPolicy`'s `t == null || retryForException(t)`.
+
 ### B.4 What this implementation does NOT include
 
 For a production-grade long-job pattern, you'd also want:
 
 - **Out-of-process credential cache** if multiple job instances run in
   parallel and you want a shared revocation point.
-- **Metrics**: lease renewals / rotations / failures exposed to Prometheus.
-- **Health check**: `/actuator/health/vault` returning `UP` only if a
-  recent renewal succeeded.
 - **Graceful kill handling**: if the JVM is SIGKILLed mid-run, Vault will
   revoke on lease expiry anyway — but you lose deterministic timing.
   (Easy add: an extra `Runtime.addShutdownHook()` call alongside
@@ -221,6 +225,27 @@ For a production-grade long-job pattern, you'd also want:
   today's `rotate()` catches its own failures and keeps the current pool,
   but the lease could be in an unknown state on the Vault side. A future
   improvement would be to log `vault token lookup-self` results.
+
+### B.5 Observability (implemented)
+
+C and D from this turn's task list — already wired into the codebase.
+
+**Metrics (`VaultMetrics`):** Micrometer counters/timers/gauges published
+via Spring Boot Actuator + Prometheus. The renewer calls
+`recordRenewalSuccess()` / `recordRenewalFailure()` on each tick;
+`recordRotation(Duration)` records end-to-end rotation latency.
+`LongJobCredentialManager` injects `VaultMetrics` via `ObjectProvider` so
+short-job mode (no actuator) keeps working without hard dep.
+
+**Health check (`VaultHealthIndicator`):** UP iff last successful
+renewal is within `threshold` (= `2 × renew-interval-seconds`, falls
+back to 300s when interval is auto-computed). UNKNOWN during the
+startup grace period; DOWN when the lease is stale.
+
+Both beans are `@ConditionalOnProperty(... long-job.enabled=true)` +
+`@ConditionalOnBean(MeterRegistry.class)` / `@ConditionalOnBean(VaultMetrics.class)`,
+so they're inert in short-job mode and don't interfere with other
+actuator configurations.
 
 ---
 

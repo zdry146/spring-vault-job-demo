@@ -6,7 +6,6 @@ import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.retry.RetryContext;
 import org.springframework.retry.backoff.ExponentialBackOffPolicy;
-import org.springframework.retry.policy.SimpleRetryPolicy;
 import org.springframework.retry.support.RetryTemplate;
 import org.springframework.stereotype.Component;
 
@@ -25,10 +24,11 @@ import java.util.Map;
  * underlying pool is being swapped under our feet, the next attempt lands
  * on the new (valid) credentials, and the query succeeds.</p>
  *
- * <p>The retry policy is broad ({@code SQLException}) on purpose: over-retry
- * of a non-auth error terminates quickly because the exception is deterministic.
- * If you want a tighter classifier, see {@code AuthFailureClassifier} and
- * wire up a custom {@link org.springframework.retry.policy.RetryPolicy}.</p>
+ * <p>The retry policy is {@link AuthFailureRetryPolicy}, which uses
+ * {@link AuthFailureClassifier} to decide retryability. Only credential-
+ * rotation-era errors (PG 28P01, MySQL 1045, Oracle ORA-01017, etc.) are
+ * retried; everything else (table not found, constraint violation, network
+ * down, etc.) propagates immediately as the deterministic failure it is.</p>
  *
  * <p>Implementation note: the JDBC work is delegated to a private method so
  * its {@code throws SQLException} clause lets the checked exception
@@ -48,10 +48,11 @@ public class LongJobBatchRunner implements CommandLineRunner {
     public LongJobBatchRunner(LongJobCredentialManager manager) {
         this.dataSource = manager.dataSource();
 
-        SimpleRetryPolicy policy = new SimpleRetryPolicy(
-                5,
-                Map.of(SQLException.class, true),
-                /* traverseCauses */ true);
+        // Tighter policy: only retry on classified auth failures
+        // (see AuthFailureRetryPolicy + AuthFailureClassifier). Non-auth
+        // SQLExceptions (e.g. 42P01 undefined_table) propagate immediately
+        // — they are deterministic, retrying them is noise.
+        AuthFailureRetryPolicy policy = new AuthFailureRetryPolicy(5);
 
         ExponentialBackOffPolicy backoff = new ExponentialBackOffPolicy();
         backoff.setInitialInterval(2_000L);

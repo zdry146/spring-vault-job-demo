@@ -64,3 +64,22 @@ logging:
   level:
     com.example.vaultjob: INFO
     org.springframework.vault: WARN
+
+# --- Spring Boot Actuator + Prometheus (long-job mode only) ---
+# VaultHealthIndicator + VaultMetrics are @ConditionalOnProperty(... long-job.enabled=true),
+# so these endpoints are useful only in long-job mode. /actuator/health/vault
+# reports UP/UNKNOWN/DOWN based on last successful lease renewal;
+# /actuator/prometheus exposes vault.lease.* counters/timers/gauges.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,prometheus}
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}

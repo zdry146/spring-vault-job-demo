@@ -7,10 +7,12 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import javax.sql.DataSource;
+import java.time.Duration;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -55,13 +57,23 @@ public class LongJobCredentialManager {
     private volatile RotatingDataSource rotatingDs;
     private volatile boolean started;
 
+    /**
+     * Metrics are optional — only present when a MeterRegistry is on the context
+     * (i.e. spring-boot-starter-actuator + micrometer-registry-prometheus are on
+     * the classpath). Using ObjectProvider keeps short-job mode working without
+     * the metrics stack.
+     */
+    private final ObjectProvider<VaultMetrics> metricsProvider;
+
     public LongJobCredentialManager(VaultCredentialProvider provider,
                                     DataSourceFactory factory,
-                                    VaultProperties props) {
+                                    VaultProperties props,
+                                    ObjectProvider<VaultMetrics> metricsProvider) {
         this.provider = provider;
         this.factory = factory;
         this.configuredRenewIntervalSeconds = props.getLongJob().getRenewIntervalSeconds();
         this.renewThresholdSeconds = props.getRenewBeforeExpirySeconds();
+        this.metricsProvider = metricsProvider;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "vault-lease-renewer");
             t.setDaemon(true);
@@ -102,13 +114,27 @@ public class LongJobCredentialManager {
             if (renewed == 0L || renewed <= renewThresholdSeconds) {
                 log.warn("Lease renewal insufficient (renewed={}s, threshold={}s); rotating",
                         renewed, renewThresholdSeconds);
+                recordMetric(m -> m.recordRenewalFailure());
                 rotate();
             } else {
                 log.debug("Lease renewed; new TTL = {}s", renewed);
+                recordMetric(m -> m.recordRenewalSuccess());
             }
         } catch (RuntimeException e) {
             // Failure isolation: a transient Vault hiccup must not kill the scheduler.
             log.error("Renew tick failed (will retry next interval)", e);
+            recordMetric(m -> m.recordRenewalFailure());
+        }
+    }
+
+    private void recordMetric(java.util.function.Consumer<VaultMetrics> action) {
+        VaultMetrics m = metricsProvider.getIfAvailable();
+        if (m != null) {
+            try {
+                action.accept(m);
+            } catch (RuntimeException ignored) {
+                // Metrics must never break the renewer
+            }
         }
     }
 
@@ -116,6 +142,8 @@ public class LongJobCredentialManager {
         if (!started) {
             return;
         }
+        long startNanos = System.nanoTime();
+        boolean rotated = false;
         try {
             DbCredentials next = provider.fetchCredentials();
             DataSource nextDs = factory.build(next);
@@ -125,8 +153,14 @@ public class LongJobCredentialManager {
             }
             activeCreds.set(next);
             log.info("Rotated DataSource: user={}, ttl={}s", next.username(), next.leaseDurationSeconds());
+            rotated = true;
         } catch (RuntimeException e) {
             log.error("Rotate failed; keeping current credentials", e);
+        } finally {
+            if (rotated) {
+                Duration elapsed = Duration.ofNanos(System.nanoTime() - startNanos);
+                recordMetric(m -> m.recordRotation(elapsed));
+            }
         }
     }
 

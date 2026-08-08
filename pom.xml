@@ -48,6 +48,18 @@
             <artifactId>spring-retry</artifactId>
         </dependency>
 
+        <!-- Actuator: exposes /actuator/health and friends; HealthIndicator SPI -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Prometheus scrape endpoint via Micrometer -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
         <!-- Database driver: PostgreSQL example. Swap to mysql-connector-j if needed. -->
         <dependency>
             <groupId>org.postgresql</groupId>

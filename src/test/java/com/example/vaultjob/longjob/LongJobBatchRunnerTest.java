@@ -9,6 +9,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -56,7 +57,7 @@ class LongJobBatchRunnerTest {
 
     @Test
     void run_retriesOnSqlException_thenSucceeds() throws SQLException {
-        // First getConnection() throws 28P01 (auth); second succeeds.
+        // First getConnection() throws 28P01 (PG auth failure); second succeeds.
         // The retry template's backoff is real but short here, so we mock
         // the SECOND call to return normally.
         when(dataSource.getConnection())
@@ -83,9 +84,26 @@ class LongJobBatchRunnerTest {
             runner.run();
             org.junit.jupiter.api.Assertions.fail("Expected IllegalStateException");
         } catch (IllegalStateException expected) {
-            // RetryTemplate's SimpleRetryPolicy does not retry on non-SQLException
-            // because traverseCauses=true walks only SQLExceptions' cause chains.
+            // AuthFailureRetryPolicy does not retry non-auth exceptions.
             verify(dataSource, times(1)).getConnection();
+        }
+    }
+
+    @Test
+    void run_propagatesNonAuthSqlExceptionImmediately() throws SQLException {
+        // 42P01 = undefined_table. AuthFailureClassifier says NOT auth,
+        // AuthFailureRetryPolicy refuses to retry, exception propagates.
+        when(dataSource.getConnection())
+                .thenThrow(new SQLException("relation \"foo\" does not exist", "42P01"));
+
+        LongJobBatchRunner runner = new LongJobBatchRunner(manager);
+
+        try {
+            runner.run();
+            org.junit.jupiter.api.Assertions.fail("Expected SQLException");
+        } catch (SQLException expected) {
+            assertThat(expected.getSQLState()).isEqualTo("42P01");
+            verify(dataSource, times(1)).getConnection();  // NOT retried
         }
     }
 }
