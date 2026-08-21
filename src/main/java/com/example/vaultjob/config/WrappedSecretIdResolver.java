@@ -2,7 +2,8 @@ package com.example.vaultjob.config;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -49,7 +50,15 @@ import java.util.Map;
  * resolvers in {@link VaultConfig} take over.</p>
  */
 @Component
-@ConditionalOnProperty(name = "vault.approle.wrapping-token")
+// Check both wrapping-token and wrapping-token-file for a NON-EMPTY value.
+// Plain @ConditionalOnProperty(name="...") defaults to matching any set property
+// except "false", which would include the empty-string default that
+// ${VAULT_WRAPPING_TOKEN:} resolves to when the env var is unset — and then
+// Spring tries to instantiate the bean with null fields, blowing up with
+// "No default constructor found".
+@ConditionalOnExpression(
+    "!'${vault.approle.wrapping-token:}'.isEmpty() "
+    + "or !'${vault.approle.wrapping-token-file:}'.isEmpty()")
 public class WrappedSecretIdResolver {
 
     private static final Logger log = LoggerFactory.getLogger(WrappedSecretIdResolver.class);
@@ -59,6 +68,7 @@ public class WrappedSecretIdResolver {
     private final String wrappingToken;
     private final String outputFile;
 
+    @Autowired
     public WrappedSecretIdResolver(VaultProperties props) {
         this(props, new RestTemplate());
     }

@@ -63,7 +63,7 @@ fi
 vault write "database/config/${DB_NAME}" \
   plugin_name="${DB_PLUGIN}" \
   allowed_roles="${DB_ROLE_NAME}" \
-  connection_url="postgresql://{{username}}:***}}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=disable" \
+  connection_url="postgresql://{{username}}:{{password}}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=disable" \
   username="${DB_ADMIN_USER}" \
   password="${DB_ADMIN_PASSWORD}" \
   >/dev/null

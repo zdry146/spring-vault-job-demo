@@ -12,6 +12,7 @@ import org.springframework.vault.authentication.AppRoleAuthenticationOptions.Sec
 import org.springframework.vault.client.VaultEndpoint;
 import org.springframework.vault.core.VaultTemplate;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.util.DefaultUriBuilderFactory;
 
 import java.io.IOException;
 import java.net.URI;
@@ -36,11 +37,24 @@ public class VaultConfig {
         VaultEndpoint endpoint = VaultEndpoint.from(URI.create(props.getUri()));
 
         // Build a RestTemplate with explicit connect/read timeouts so a stuck
-        // Vault can never wedge the job indefinitely.
+        // Vault can never wedge the job indefinitely. We MUST also wire a
+        // UriTemplateHandler rooted at the VaultEndpoint, because AppRoleAuthentication
+        // posts to a *relative* path ("auth/approle/login"). Without a base URI,
+        // SimpleClientHttpRequestFactory.createRequest blows up with
+        // "URI is not absolute".
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(props.getConnectionTimeoutSeconds() * 1000);
         factory.setReadTimeout(props.getReadTimeoutSeconds() * 1000);
         RestTemplate restTemplate = new RestTemplate(factory);
+        // Construct the base URI manually: VaultEndpoint.createUriString("") asserts
+        // the path is non-empty, and createUriString("/") yields ".../v1//" (double
+        // slash). The cleanest fix is to build "{scheme}://{host}:{port}/{path}/"
+// ourselves so that Spring's UriTemplateHandler resolves relative paths
+        // like "auth/approle/login" to ".../v1/auth/approle/login". Without /v1/
+        // Vault responds with a 307 redirect to its UI.
+        String baseUri = String.format("%s://%s:%d/%s/",
+                endpoint.getScheme(), endpoint.getHost(), endpoint.getPort(), endpoint.getPath());
+        restTemplate.setUriTemplateHandler(new DefaultUriBuilderFactory(baseUri));
 
         if (!"approle".equalsIgnoreCase(props.getAuthMethod())) {
             throw new IllegalStateException(

@@ -1,0 +1,63 @@
+# K8s Job manifest for spring-vault-job-demo
+# ----------------------------------------------------------------------------
+# Run with:
+#   kubectl apply -f deploy/k8s/job.yaml
+# Logs:
+#   kubectl -n vault-demo logs -l app=spring-vault-job-demo
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault-demo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-job-credentials
+  namespace: vault-demo
+type: Opaque
+stringData:
+  # Long-lived AppRole role-id (safe-ish, but still keep in Secret)
+  role-id: "REPLACE_WITH_VAULT_READ_OUTPUT_auth/approle/role/spring-vault-job-demo/role-id"
+  # Short-lived (5 min) wrapping token. Generate at deploy time:
+  #   vault write -wrap-ttl=300s -f auth/approle/role/spring-vault-job-demo/secret-id
+  # The job will unwrap it on startup → single-use secret_id → AppRole login.
+  wrapping-token: "REPLACE_AT_DEPLOY_TIME_WITH_FRESH_VAULT_WRAP_OUTPUT"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spring-vault-job-demo
+  namespace: vault-demo
+  labels:
+    app: spring-vault-job-demo
+    tier: batch
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: spring-vault-job-demo
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: app
+        image: spring-vault-job-demo:0.1.0
+        imagePullPolicy: Never          # image lives in host docker daemon (kubeadm + cri-dockerd)
+        env:
+        - name: VAULT_ADDR
+          value: "http://192.168.232.128:8200"
+        - name: VAULT_ROLE_ID
+          valueFrom:
+            secretKeyRef: { name: vault-job-credentials, key: role-id }
+        - name: VAULT_WRAPPING_TOKEN    # secret_id never lives in K8s Secret — only the wrap-token
+          valueFrom:
+            secretKeyRef: { name: vault-job-credentials, key: wrapping-token }
+        - name: VAULT_DB_ROLE
+          value: "spring-job-role"
+        - name: DB_JDBC_URL
+          value: "jdbc:postgresql://192.168.232.128:5432/testdb?sslmode=disable"
+        resources:
+          requests: { memory: "256Mi", cpu: "200m" }
+          limits:   { memory: "512Mi", cpu: "500m" }
