@@ -40,9 +40,10 @@ lease on shutdown.
 │   └── revoke/
 │       └── LeaseRevokingShutdownHook.java  # @PreDestroy + optional JVM hook
 ├── src/test/java/...                       # Mockito unit tests (no real Vault needed); 62 tests
+├── Jenkinsfile                              # Pattern B deploy pipeline (Jenkins in-network CI)
 ├── scripts/
-│   ├── vault-setup.sh                      # idempotent one-shot Vault admin setup
-│   └── wrap-secret-id.sh                   # re-fetch secret-id; writes to file with mode 600
+│   ├── vault-setup.sh                      # idempotent one-shot Vault admin setup (job + CI approles)
+│   └── wrap-secret-id.sh                   # CI-side wrapping-token injector (Pattern B: login CI → wrap secret-id → patch K8s Secret → restart Job)
 └── docs/
     ├── lifecycle.md                        # short-job vs long-job rotation pattern (B is implemented)
     └── vault-agent-sidecar.md              # Vault Agent daemon for VMs (alternative to demo's auth flow)

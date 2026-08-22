@@ -120,10 +120,51 @@ else
   echo "    approle ${APPROLE_NAME} already exists (skipping)"
 fi
 
-# --- 8. Print credentials ---------------------------------------------------
+# --- 8. CI AppRole (separate role for CI callers; least-privilege) -------
+# Why a separate role? The job's AppRole policy allows database/creds/*,
+# which is overkill for CI — CI only needs to mint wrapping tokens for
+# the job's secret-id path. Splitting roles means a CI credential leak
+# can't be used to read live DB credentials.
+CI_APPROLE_NAME="${CI_APPROLE_NAME:-ci-${APPROLE_NAME}}"
+CI_APPROLE_POLICY_NAME="${CI_APPROLE_POLICY_NAME:-ci-${APPROLE_POLICY_NAME}}"
+CI_APPROLE_SECRET_TTL="${CI_APPROLE_SECRET_TTL:-24h}"
+CI_APPROLE_TOKEN_TTL="${CI_APPROLE_TOKEN_TTL:-15m}"
+CI_APPROLE_TOKEN_MAX_TTL="${CI_APPROLE_TOKEN_MAX_TTL:-1h}"
+
+CI_POLICY_PATH="$(mktemp)"
+cat >"${CI_POLICY_PATH}" <<EOF
+# CI policy: only allow wrapping for the job's AppRole secret-id.
+# Least privilege — CI cannot read database creds or manage other roles.
+# Path is hard-coded to the JOB role (defined above); CI cannot reach other roles.
+path "auth/approle/role/${APPROLE_NAME}/secret-id" {
+  capabilities = ["create", "update"]
+}
+path "auth/approle/role/${APPROLE_NAME}/role-id" {
+  capabilities = ["read"]
+}
+EOF
+vault policy write "${CI_APPROLE_POLICY_NAME}" "${CI_POLICY_PATH}" >/dev/null
+rm -f "${CI_POLICY_PATH}"
+echo "    wrote CI policy: ${CI_APPROLE_POLICY_NAME}"
+
+if ! vault read "auth/approle/role/${CI_APPROLE_NAME}" >/dev/null 2>&1; then
+  vault write "auth/approle/role/${CI_APPROLE_NAME}" \
+    secret_id_ttl="${CI_APPROLE_SECRET_TTL}" \
+    token_ttl="${CI_APPROLE_TOKEN_TTL}" \
+    token_max_ttl="${CI_APPROLE_TOKEN_MAX_TTL}" \
+    token_num_uses=0 \
+    secret_id_num_uses=0 \
+    policies="${CI_APPROLE_POLICY_NAME}" \
+    >/dev/null
+  echo "    created CI approle: ${CI_APPROLE_NAME}"
+else
+  echo "    CI approle ${CI_APPROLE_NAME} already exists (skipping)"
+fi
+
+# --- 9. Print credentials ---------------------------------------------------
 echo
 echo "================================================================"
-echo " DONE. Use the following to run the job:"
+echo " JOB CREDENTIALS (run with these locally — DO NOT commit):"
 echo "================================================================"
 ROLE_ID="$(vault read -format=json "auth/approle/role/${APPROLE_NAME}/role-id" | jq -r .data.role_id)"
 SECRET_ID_JSON="$(vault write -format=json -f "auth/approle/role/${APPROLE_NAME}/secret-id")"
@@ -138,11 +179,27 @@ echo "export DB_JDBC_URL='jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}'"
 
 if [[ -n "${WRAPPING_TOKEN}" ]]; then
   echo
-  echo "(wrapped secret-id available; use scripts/wrap-secret-id.sh to fetch)"
+  echo "(wrapping token for the job's secret-id — use scripts/wrap-secret-id.sh at deploy time instead)"
 fi
+
+echo
+echo "================================================================"
+echo " CI CREDENTIALS (store in Jenkins Credentials store, kind=Secret text):"
+echo "================================================================"
+CI_ROLE_ID="$(vault read -format=json "auth/approle/role/${CI_APPROLE_NAME}/role-id" | jq -r .data.role_id)"
+CI_SECRET_ID="$(vault write -format=json -f "auth/approle/role/${CI_APPROLE_NAME}/secret-id" | jq -r .data.secret_id)"
+
+echo "  Jenkins credential ID: ci-vault-role-id"
+echo "    secret value: ${CI_ROLE_ID}"
+echo
+echo "  Jenkins credential ID: ci-vault-secret-id"
+echo "    secret value: ${CI_SECRET_ID}"
+echo
+echo "  After creating both, the Jenkinsfile (withCredentials block)"
+echo "  will inject them as CI_VAULT_ROLE_ID / CI_VAULT_SECRET_ID env vars."
 
 echo "================================================================"
 echo " WARNING: these credentials are sensitive — do NOT log them."
-echo " In production, fetch secret-id at deploy time, store in a"
-echo " secret manager, and inject as VAULT_SECRET_ID_FILE."
+echo " In production, CI uses wrapping-token (Pattern B) so the job's"
+echo " secret_id never lives in any config / env / file at rest."
 echo "================================================================"
