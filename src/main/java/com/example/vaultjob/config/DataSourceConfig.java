@@ -35,17 +35,28 @@ public class DataSourceConfig {
     private static final Logger log = LoggerFactory.getLogger(DataSourceConfig.class);
 
     /**
+     * Shared factory. Always active so both job modes can inject it.
+     * (Without this bean, {@link LongJobCredentialManager} fails to construct
+     * in long-job mode — see 2026-08-22 Pattern B K8s deploy debug.)
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public DataSourceFactory dataSourceFactory(VaultProperties props) {
+        return new DataSourceFactory(props);
+    }
+
+    /**
      * Short-job pool. Eagerly fetches credentials at startup.
      */
     @Bean(destroyMethod = "close")
     @ConditionalOnProperty(name = "vault.long-job.enabled", havingValue = "false", matchIfMissing = true)
     @ConditionalOnMissingBean(DataSource.class)
-    public HikariDataSource shortJobDataSource(VaultProperties props,
-                                               VaultCredentialProvider credentialProvider) {
+    public HikariDataSource shortJobDataSource(VaultCredentialProvider credentialProvider,
+                                               DataSourceFactory factory) {
         DbCredentials creds = credentialProvider.fetchCredentials();
         log.info("Acquired dynamic DB credentials from Vault (user={}, lease_ttl={}s) — short-job mode",
                 creds.username(), creds.leaseDurationSeconds());
-        return new DataSourceFactory(props).build(creds);
+        return factory.build(creds);
     }
 
     /**

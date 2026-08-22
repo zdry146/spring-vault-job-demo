@@ -1,28 +1,38 @@
-# K8s Job manifest for spring-vault-job-demo
+# K8s Job manifest for spring-vault-job-demo (Pattern B long-job mode)
 # ----------------------------------------------------------------------------
-# Run with:
-#   kubectl apply -f deploy/k8s/job.yaml
+# Two-step deploy (Secret and Job live in separate files):
+#
+#   1. Provision Secret (deploy-time, NOT committed):
+#        ROLE_ID=$(vault read -format=json auth/approle/role/spring-vault-job-demo/role-id | jq -r .data.role_id)
+#        WT=$(vault write -format=json -wrap-ttl=300s -f auth/approle/role/spring-vault-job-demo/secret-id | jq -r .wrap_info.token)
+#        kubectl create namespace vault-demo
+#        kubectl -n vault-demo create secret generic vault-job-credentials \
+#            --from-literal=role-id="$ROLE_ID" \
+#            --from-literal=wrapping-token="$WT"
+#
+#   2. Apply this Job (declarative, committed to git):
+#        kubectl apply -f deploy/k8s/job.yaml
+#
 # Logs:
 #   kubectl -n vault-demo logs -l app=spring-vault-job-demo
+#
+# Pattern B knobs (set in this Job spec):
+#   - VAULT_LONG_JOB_ENABLED=true activates LongJobCredentialManager
+#     (background renewer + DataSource rotation on renewal failure)
+#   - VAULT_LONG_JOB_RUN_SECONDS=120 keeps JVM alive 2 min so renewer
+#     ticks >=4 times (default_ttl=30s, renew_interval=max(30, ttl/2)=30s)
+#   - LEASE_RENEW_BEFORE_SECONDS=35 forces rotation: a renewed ttl of 30s
+#     is < 35s threshold → rotation every renewal tick (clean demo of
+#     the lease rotation path)
+#
+# IMPORTANT: keep this file in git WITHOUT the Secret inline. If you re-apply
+# a file that contains a Secret placeholder, kubectl apply will overwrite the
+# actual Secret values with the placeholder (the bug we hit on 2026-08-22).
 # ----------------------------------------------------------------------------
 apiVersion: v1
 kind: Namespace
 metadata:
   name: vault-demo
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: vault-job-credentials
-  namespace: vault-demo
-type: Opaque
-stringData:
-  # Long-lived AppRole role-id (safe-ish, but still keep in Secret)
-  role-id: "REPLACE_WITH_VAULT_READ_OUTPUT_auth/approle/role/spring-vault-job-demo/role-id"
-  # Short-lived (5 min) wrapping token. Generate at deploy time:
-  #   vault write -wrap-ttl=300s -f auth/approle/role/spring-vault-job-demo/secret-id
-  # The job will unwrap it on startup → single-use secret_id → AppRole login.
-  wrapping-token: "REPLACE_AT_DEPLOY_TIME_WITH_FRESH_VAULT_WRAP_OUTPUT"
 ---
 apiVersion: batch/v1
 kind: Job
@@ -35,6 +45,7 @@ metadata:
 spec:
   backoffLimit: 2
   ttlSecondsAfterFinished: 300
+  activeDeadlineSeconds: 240          # job wall-clock cap (must exceed VAULT_LONG_JOB_RUN_SECONDS)
   template:
     metadata:
       labels:
@@ -43,7 +54,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: app
-        image: spring-vault-job-demo:0.1.0
+        image: spring-vault-job-demo:0.4.0-patternB-v3
         imagePullPolicy: Never          # image lives in host docker daemon (kubeadm + cri-dockerd)
         env:
         - name: VAULT_ADDR
@@ -51,13 +62,20 @@ spec:
         - name: VAULT_ROLE_ID
           valueFrom:
             secretKeyRef: { name: vault-job-credentials, key: role-id }
-        - name: VAULT_WRAPPING_TOKEN    # secret_id never lives in K8s Secret — only the wrap-token
+        - name: VAULT_WRAPPING_TOKEN    # secret_id never lands in K8s Secret
           valueFrom:
             secretKeyRef: { name: vault-job-credentials, key: wrapping-token }
         - name: VAULT_DB_ROLE
           value: "spring-job-role"
         - name: DB_JDBC_URL
           value: "jdbc:postgresql://192.168.232.128:5432/testdb?sslmode=disable"
+        # ----- Pattern B knobs -----
+        - name: VAULT_LONG_JOB_ENABLED
+          value: "true"                  # activates LongJobCredentialManager + LongJobBatchRunner
+        - name: VAULT_LONG_JOB_RUN_SECONDS
+          value: "120"                   # JVM lives 2 min so renewer ticks >=4 times
+        - name: LEASE_RENEW_BEFORE_SECONDS
+          value: "35"                    # threshold > default_ttl(30s) → rotation on every renewal
         resources:
           requests: { memory: "256Mi", cpu: "200m" }
           limits:   { memory: "512Mi", cpu: "500m" }

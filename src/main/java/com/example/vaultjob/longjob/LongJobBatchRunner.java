@@ -67,7 +67,38 @@ public class LongJobBatchRunner implements CommandLineRunner {
     @Override
     public void run(String... args) throws SQLException {
         log.info("=== Long-running batch job started ===");
+        // Read VAULT_LONG_JOB_RUN_SECONDS (default 0 = single-shot).
+        // > 0 keeps the JVM alive that many seconds so the background renewer
+        // (LongJobCredentialManager) can tick at least once and (if the
+        // threshold forces it) rotate the credential pair.
+        long runSeconds = Long.parseLong(
+                System.getenv().getOrDefault("VAULT_LONG_JOB_RUN_SECONDS", "0"));
+        long heartbeatSeconds = 15;  // re-query every 15s for fresh audit-trail evidence
+
         Integer count = retry.execute(this::doQuery);
+        log.info("[initial query] tables={}", count);
+
+        if (runSeconds > 0) {
+            long deadline = System.currentTimeMillis() + runSeconds * 1000L;
+            int iter = 1;
+            while (System.currentTimeMillis() < deadline) {
+                long remainingMs = deadline - System.currentTimeMillis();
+                long sleepMs = Math.min(remainingMs, heartbeatSeconds * 1000L);
+                log.info("[heartbeat {}] sleeping {}ms before next query...", iter, sleepMs);
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException ie) {
+                    // Restore interrupt flag and abort the loop — JVM is being torn down.
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(
+                            "Long-job interrupted while waiting for next heartbeat", ie);
+                }
+                count = retry.execute(this::doQuery);
+                log.info("[heartbeat {}] query OK, tables={}", iter, count);
+                iter++;
+            }
+        }
+
         log.info("=== Long-running batch job finished cleanly (tables={}) ===", count);
     }
 
