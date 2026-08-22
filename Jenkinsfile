@@ -94,22 +94,24 @@ pipeline {
             }
         }
 
-        stage('2. Inject image into cluster node') {
-            // kubeadm + cri-dockerd — images must be in the host docker daemon
-            // where kubelet runs. If Jenkins shares that host, this stage is
-            // effectively a no-op (image already local).
+        stage('2. Verify image is on host docker daemon') {
+            // Jenkins container runs with --net=host + /var/run/docker.sock bind,
+            // so any docker build done inside the container already lands in
+            // the host's docker daemon (which is where kubelet reads from).
+            // No "ship image" step needed — the image built in stage 1 IS the
+            // image kubelet will see. We just verify presence here as a sanity check.
             steps {
                 sh '''
                     set -euo pipefail
-                    REMOTE_HAS=$(ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
-                        ${K8S_HOST} \
-                        "docker images --format '{{.Repository}}:{{.Tag}}' ${IMAGE_NAME}:${IMAGE_TAG} 2>/dev/null || true")
-                    if echo "$REMOTE_HAS" | grep -q "^${IMAGE_NAME}:${IMAGE_TAG}\$"; then
-                        echo "image already present on ${K8S_HOST} — skipping ship"
+                    if docker images --format '{{.Repository}}:{{.Tag}}' \
+                        | grep -q "^${IMAGE_NAME}:${IMAGE_TAG}\$"; then
+                        echo "  ✓ ${IMAGE_NAME}:${IMAGE_TAG} present in host docker daemon"
+                        docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}' \
+                            | grep "^${IMAGE_NAME}\b" || true
                     else
-                        echo "shipping image to ${K8S_HOST}..."
-                        docker save ${IMAGE_NAME}:${IMAGE_TAG} | \
-                            ssh -o StrictHostKeyChecking=no -o BatchMode=yes ${K8S_HOST} docker load
+                        echo "ERROR: image not found in host docker daemon" >&2
+                        docker images 2>&1 || true
+                        exit 1
                     fi
                 '''
             }
