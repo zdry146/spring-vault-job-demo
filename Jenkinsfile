@@ -81,6 +81,11 @@ pipeline {
                 dir('src') {
                     sh '''
                         set -euo pipefail
+                        # Dockerfile expects target/ from mvn package (host-side build).
+                        # We could refactor to multi-stage, but the host build is faster
+                        # (no re-running toolchain in docker) and the Jenkins container
+                        # has mvn installed (apt-installed 3.9.9).
+                        mvn -B -DskipTests package
                         docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
                         docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
                         echo "built ${IMAGE_NAME}:${IMAGE_TAG}"
