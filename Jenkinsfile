@@ -40,14 +40,52 @@ pipeline {
 
     stages {
 
-        stage('1. Build Docker image') {
+        stage('0. Fetch source (github→gitee fallback)') {
+            // Pattern from post-api-cicd: re-clone the repo in the Jenkinsfile body
+            // with try-github / fallback-gitee logic. The SCM plugin above only
+            // fetched the Jenkinsfile; this stage gets the rest of the source
+            // into ./src/ so all subsequent stages have a reliable copy.
             steps {
                 sh '''
                     set -euo pipefail
-                    docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
-                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
-                    echo "built ${IMAGE_NAME}:${IMAGE_TAG}"
+                    REPO="spring-vault-job-demo"
+                    BRANCH="master"
+
+                    if [ ! -d src/.git ]; then
+                        rm -rf src
+                        echo "=== Trying github.com ==="
+                        if git clone --depth=1 -b "$BRANCH" \
+                                "git@github.com:zdry146/${REPO}.git" src 2>/tmp/github-clone.log; then
+                            echo "  ✓ github clone ok"
+                        else
+                            echo "  github clone failed, falling back to gitee..."
+                            cat /tmp/github-clone.log
+                            echo "=== Trying gitee.com ==="
+                            if ! git clone --depth=1 -b "$BRANCH" \
+                                    "git@gitee.com:zdry146/${REPO}.git" src 2>/tmp/gitee-clone.log; then
+                                echo "ERROR: both github and gitee clone failed"
+                                cat /tmp/gitee-clone.log
+                                exit 1
+                            fi
+                            echo "  ✓ gitee clone ok (fallback)"
+                        fi
+                    else
+                        echo "  src/ already populated, skipping clone"
+                    fi
                 '''
+            }
+        }
+
+        stage('1. Build Docker image') {
+            steps {
+                dir('src') {
+                    sh '''
+                        set -euo pipefail
+                        docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+                        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+                        echo "built ${IMAGE_NAME}:${IMAGE_TAG}"
+                    '''
+                }
             }
         }
 
@@ -78,15 +116,17 @@ pipeline {
                     string(credentialsId: 'ci-vault-role-id',   variable: 'CI_VAULT_ROLE_ID'),
                     string(credentialsId: 'ci-vault-secret-id', variable: 'CI_VAULT_SECRET_ID'),
                 ]) {
-                    sh '''
-                        set -euo pipefail
-                        export VAULT_ADDR CI_VAULT_ROLE_ID CI_VAULT_SECRET_ID \
-                               JOB_APPROLE_NAME K8S_NAMESPACE K8S_SECRET_NAME \
-                               K8S_JOB_NAME WRAP_TTL_SECONDS RESTART_JOB
-                        # K8S_CONTEXT intentionally unset → kubectl uses default context.
-                        # Override via Jenkins job parameter if you have multiple clusters.
-                        ./scripts/wrap-secret-id.sh
-                    '''
+                    dir('src') {
+                        sh '''
+                            set -euo pipefail
+                            export VAULT_ADDR CI_VAULT_ROLE_ID CI_VAULT_SECRET_ID \
+                                   JOB_APPROLE_NAME K8S_NAMESPACE K8S_SECRET_NAME \
+                                   K8S_JOB_NAME WRAP_TTL_SECONDS RESTART_JOB
+                            # K8S_CONTEXT intentionally unset → kubectl uses default context.
+                            # Override via Jenkins job parameter if you have multiple clusters.
+                            ./scripts/wrap-secret-id.sh
+                        '''
+                    }
                 }
             }
         }
@@ -96,7 +136,9 @@ pipeline {
             // re-apply the manifest here so the orchestrator (kubectl / ArgoCD
             // / your GitOps tool) re-creates it with the fresh wrapping token.
             steps {
-                sh "kubectl apply -f ${K8S_MANIFEST}"
+                dir('src') {
+                    sh "kubectl apply -f ${K8S_MANIFEST}"
+                }
             }
         }
     }
