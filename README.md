@@ -42,7 +42,9 @@ lease on shutdown.
 ├── src/test/java/...                       # Mockito unit tests (no real Vault needed); 62 tests
 ├── Jenkinsfile                              # Pattern B deploy pipeline (Jenkins in-network CI)
 ├── scripts/
-│   ├── vault-setup.sh                      # idempotent one-shot Vault admin setup (job + CI approles)
+│   ├── vault-setup.sh                      # idempotent one-shot Vault admin setup — PostgreSQL target (job + CI approles)
+│   ├── vault-oracle-setup.sh               # Oracle target variant (heavier revocation path, PDB service, app_profile)
+│   ├── oracle-prereq.sql                   # one-shot DBA script: vault_admin user + app_profile (run on Oracle before the shell script)
 │   └── wrap-secret-id.sh                   # CI-side wrapping-token injector (Pattern B: login CI → wrap secret-id → patch K8s Secret → restart Job)
 └── docs/
     ├── lifecycle.md                        # short-job vs long-job rotation pattern (B is implemented)
@@ -133,6 +135,8 @@ java -jar my-job.jar
 
 ## Quick start (local dev)
 
+### PostgreSQL path
+
 ```bash
 # 1. Bring up Vault + Postgres
 docker compose up -d
@@ -151,6 +155,101 @@ export VAULT_DB_ROLE=mydb-role
 export DB_JDBC_URL=jdbc:postgresql://127.0.0.1:5432/mydb
 mvn spring-boot:run
 ```
+
+### Oracle path
+
+Oracle is ~15-100× heavier on `CREATE USER` / `DROP USER CASCADE` than PostgreSQL,
+so the Oracle variant bakes in all the pitfalls (PDB service, dedicated `vault_admin`,
+dedicated `app_profile` with `verify_function` off, KILL SESSION before DROP,
+short username template ≤ 30 bytes, etc.). Full list in the script's header.
+
+```bash
+# 1. Run the Oracle prerequisite script once, as a DBA (SYS/SYSTEM).
+#    Connects to a PDB service (e.g. ORCLPDB1), not CDB$ROOT.
+sqlplus sys/<sys-pw>@//oracle-prod.local:1521/ORCLPDB1 as sysdba \
+  @scripts/oracle-prereq.sql
+# ↑ creates vault_admin + app_profile + sanity checks.
+#   Then change the placeholder password on vault_admin:
+sqlplus sys/<sys-pw>@//oracle-prod.local:1521/ORCLPDB1 as sysdba
+SQL> ALTER USER vault_admin IDENTIFIED BY "real-password" REPLACE ***;
+
+# 2. Configure Vault against the Oracle target
+export VAULT_ADDR=http://127.0.0.1:8200
+export VAULT_TOKEN=<root-token>
+export ORACLE_HOST=oracle-prod.local
+export ORACLE_PORT=1521
+export ORACLE_SERVICE=ORCLPDB1              # ← PDB service, not CDB
+export ORACLE_USER=vault_admin
+export ORACLE_PASSWORD=***        # the password you set in step 1
+./scripts/vault-oracle-setup.sh
+# ↑ prints VAULT_ROLE_ID and VAULT_SECRET_ID at the end, plus an
+#   "ORACLE OPERATIONAL REMINDERS" block
+
+# 3. Build + run the job — DB_JDBC_URL points at Oracle instead
+export VAULT_ROLE_ID=...
+export VAULT_SECRET_ID=...
+export VAULT_DB_ROLE=oracle-app-role
+export DB_JDBC_URL='jdbc:oracle:thin:@//oracle-prod.local:1521/ORCLPDB1'
+mvn spring-boot:run
+```
+
+> **Don't issue creds at >10/min** on Oracle: `DROP USER CASCADE` is 200ms–seconds
+> and triggers dictionary-cache work. For high-frequency issuance, switch to
+> Vault's `database/static-roles/<name>` (single user, password rotation only)
+> — see `vault-oracle-setup.sh`'s header for the recommended split.
+
+### Oracle troubleshooting
+
+Most-common failures when first running the Oracle path, in the order you'll usually hit them:
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `ORA-65096: invalid common user or role name` | Connected to **CDB$ROOT**, not a PDB | Reconnect using the **PDB service name** (e.g. `ORCLPDB1`), not the SID. |
+| `ORA-01950: no privileges on tablespace 'SYSTEM'` | Dynamic users default to SYSTEM tablespace; `vault_admin` lacks QUOTA | `ALTER USER vault_admin QUOTA UNLIMITED ON users;` (already in `oracle-prereq.sql`). |
+| `ORA-01017: invalid username/password` (from app) | Vault's random password rejected by `verify_function_11G` (DEFAULT profile) | Re-run `oracle-prereq.sql` — it creates `app_profile` with `PASSWORD_VERIFY_FUNCTION = NULL`. |
+| `ORA-01940: cannot drop a user that is currently connected` | Revocation fires while a session is still open | The script's `revocation_statements` already does `LOCK → KILL SESSION → DROP CASCADE`. If you hit it, the lease will retry on the next sweep; manually clean with the SQL below. |
+| `ORA-00972: identifier is too long` | Vault's default username pattern (`V_<role>_<hash>`) > 30 bytes | Override `DB_USERNAME_TEMPLATE` (default `VA_{{ random 8 }}_U` is 13 bytes). |
+| `ORA-28000: the account is locked` | Oracle's `FAILED_LOGIN_ATTEMPTS=10` tripped during an auth-failure retry storm | `app_profile` sets it to `UNLIMITED`. Verify: `SELECT limit FROM dba_profiles WHERE profile='APP_PROFILE' AND resource_name='FAILED_LOGIN_ATTEMPTS';` |
+| Vault: `500 Internal Server Error` on `database/creds/...` | Mostly: ① connection URL wrong (CDB root, bad service), ② `vault_admin` password wrong, ③ network ACL | `vault read database/config/<name>` returns the error in plain text. Fix the connection first; re-run `vault-oracle-setup.sh`. |
+| Vault: `permission denied` on `database/creds/<role>` | `vault_policy_read` not attached to the AppRole | `vault read auth/approle/role/<name>/policies` — must contain `spring-vault-job-demo-oracle`. |
+| Leases piling up in Oracle (`dba_users` count climbing) | TTL too short vs job rate, or revocation failing | See pitfall #18: bump `DB_DEFAULT_TTL` to 30m+ or switch to static-roles for > 10/min. |
+| After rotating vault_admin password, dynamic creds stop | Vault cached the old password in `database/config/<name>` | `vault write database/config/<name> password=<new-pw>` to refresh, or `vault write -f database/rotate-root/<name>` does this for you. |
+
+**Manual cleanup** for stuck sessions / leaked users:
+
+```sql
+-- Find dynamic users and kill any lingering sessions
+SELECT 'ALTER SYSTEM KILL SESSION ''' || sid || ',' || serial# || ''' IMMEDIATE;'
+  FROM v$session WHERE username LIKE 'VA_%';
+-- Then
+SELECT 'DROP USER ' || username || ' CASCADE;' FROM dba_users WHERE username LIKE 'VA_%';
+```
+
+### Static-role path (high-frequency Oracle)
+
+If the job needs to fetch a credential **more than ~10/min**, or multiple jobs
+share one Oracle schema, use `scripts/vault-oracle-static-role.sh`. Vault
+rotates one pre-existing user's password instead of CREATE+DROP:
+
+```bash
+export APP_DB_USER=app_shared_user          # MUST exist; add a CREATE USER to oracle-prereq.sql for it
+export ROTATION_PERIOD=24h                  # password-leak window
+./scripts/vault-oracle-static-role.sh
+```
+
+The job then authenticates to Vault exactly the same way (AppRole), but
+reads `database/static-creds/<name>` instead of `database/creds/<name>`.
+No lease — Vault just rotates the password on `rotation_period`; the job
+re-reads when it sees the old password fail auth (covered by
+`AuthFailureClassifier` in the long-job mode).
+
+| | Dynamic (default) | Static (high-frequency) |
+|---|---|---|
+| Oracle cost per issuance | CREATE USER + GRANT (20-80ms) + DROP CASCADE on revoke (200ms+) | One `ALTER USER` on rotation schedule |
+| Identity per request | Unique `VA_xxxxxxxxxx_U` user | Always the same `app_shared_user` |
+| Audit clarity | Per-user trails in `SYS.AUD$` | Single user, sessions distinguished by `v$session.username` only |
+| Lease needed | Yes (`sys/leases/renew`, `sys/leases/revoke`) | No — rotation is time-based, not lease-based |
+| Best for | Per-tenant isolation, bursty low rate | Shared schema, high rate, simple audit |
 
 Expected log tail:
 
